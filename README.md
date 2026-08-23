@@ -74,8 +74,10 @@ performs no registry interaction.
 | tag                      | False    | `latest` | npm distribution tag                                                                 |
 | access                   | False    | `''`     | Package access: `public`, `restricted` or unset                                      |
 | provenance               | False    | `false`  | Generate registry-native provenance; needs registry and OIDC support                 |
-| nexus_user               | False    | `''`     | Registry username (default: calling repository name)                                 |
-| nexus_password           | False    | `''`     | Registry password/token; required for real publishes unless `load_credential`        |
+| nexus_user               | False    | `''`     | Basic auth username (default: calling repository name); ignored by token/OIDC modes  |
+| nexus_password           | False    | `''`     | Registry password for Basic auth; required for real publishes unless another mode    |
+| auth_token               | False    | `''`     | Bearer token written as `_authToken`; for registries rejecting Basic auth            |
+| oidc                     | False    | `false`  | Publish via npm OIDC trusted publishing; stores no credential                        |
 | load_credential          | False    | `false`  | Fetch the password from 1Password via credential-load-action                         |
 | vault_mapping_json       | False    | `''`     | JSON mapping repository owner to 1Password vault (with `load_credential`)            |
 | op_service_account_token | False    | `''`     | 1Password service account token (with `load_credential`)                             |
@@ -147,15 +149,72 @@ entirely, so it needs no `registry_url` and no credential inputs.
 Every test in this repository's testing workflow runs in dry-run
 mode; CI holds no registry credentials.
 
+## Authentication Modes
+
+Three mutually exclusive modes. Supplying more than one fails the
+action rather than picking a winner, since the effective credential
+would otherwise be ambiguous.
+
+### Basic auth (Nexus)
+
+Pass `nexus_password` directly, or set `load_credential: 'true'` with
+`vault_mapping_json` and `op_service_account_token` to fetch it from
+1Password. `node-create-npmrc-action` writes an `_auth` entry holding
+`base64(username:password)`.
+
+### Bearer token
+
+Pass `auth_token`. Written as an `_authToken` entry. Registries that
+reject Basic auth for publishing, notably `registry.npmjs.org`,
+require this form.
+
+`nexus_user` plays no part in token or OIDC publishing, since neither
+carries a username. Setting it alongside either mode is inert rather
+than an error — callers that compute it unconditionally, such as a
+matrix publishing to both Nexus and npmjs.org, would otherwise have
+to strip it per target. The action emits a `::notice::` naming it as
+ignored.
+
+### OIDC trusted publishing
+
+Set `oidc: 'true'`. The action stores no credential anywhere: npm
+exchanges a GitHub OIDC token for a short-lived publish token, and
+generates provenance itself.
+
+The action preflights two of the requirements, failing before any
+registry interaction:
+
+- `id-token: write` on the calling job, detected via the token
+  endpoint. With `workflow_call`, npm needs the grant on **both** the
+  caller and the called workflow
+- npm >= 11.5.1 **and** Node >= 22.14.0. Meeting the Node floor does
+  not meet the npm one — Node 22 ships npm 10.x, and even Node 24.0.0
+  ships npm 11.3.0 — so run a step such as `npm install -g npm@^11`
+  beforehand. The action reports this rather than upgrading npm
+  behind your back
+
+npm enforces the rest at publish time, and the action cannot check
+them in advance:
+
+- GitHub-hosted runners; npm does not support self-hosted runners
+  for trusted publishing
+- The package's `repository.url` must match the GitHub repository
+- npm validates the **calling** workflow's filename, so register the
+  trusted publisher against the caller (for example
+  `gerrit-merge.yaml`), not the reusable workflow
+
+Provenance is not generated for packages published from private
+repositories, even when the package itself is public.
+
 ## Credential Handling
 
 `node-create-npmrc-action` masks the credential material, writes the
 `.npmrc` with restrictive permissions and registers a guaranteed
 post-job step that scrubs the file again — including when later steps
-fail. This action adds no duplicate cleanup logic. Credential supply
-follows the organisation's model: pass `nexus_password` directly, or
-set `load_credential: 'true'` with `vault_mapping_json` and
-`op_service_account_token` to fetch the password from 1Password.
+fail. This action adds no duplicate cleanup logic.
+
+OIDC skips that machinery entirely: the action writes nothing, so no
+file needs scrubbing.
 
 ## Provenance
 
@@ -165,6 +224,11 @@ with provenance support (npmjs.org) and requires an OIDC token
 (`id-token: write` permission). Nexus has no provenance support, so
 leave the input at `false` for Nexus targets; generate GitHub
 artifact attestations for the packed tarball instead.
+
+With `oidc: 'true'` the flag is redundant, because npm generates
+provenance for trusted publishes on its own. The action rejects the
+combination rather than passing a flag whose effect is already
+implied.
 
 ## Path Constraints
 

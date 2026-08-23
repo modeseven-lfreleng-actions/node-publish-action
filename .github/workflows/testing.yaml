@@ -399,3 +399,211 @@ jobs:
           echo "Version lifecycle scripts correctly suppressed ✅"
           echo "Version lifecycle scripts correctly suppressed ✅" \
             >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test authentication mode validation ###
+  test-auth-modes:
+    name: "Test: authentication mode validation"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Create minimal project fixture"
+        shell: bash
+        run: |
+          # Create minimal project fixture
+          mkdir -p auth-project
+          printf '%s\n' \
+            '{"name": "auth-project", "version": "1.0.0"}' \
+            > auth-project/package.json
+
+      # Ambiguous credentials must fail rather than silently pick one.
+      # The token below is a test literal, not a real credential.
+      - name: "Token plus password [expected failure]"
+        id: token-and-password
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: auth-project
+          publish_version: '1.0.0'
+          registry_url: 'https://registry.npmjs.org/'
+          auth_token: 'npm_testTOKEN0123456789abcdefGHIJKLM'
+          nexus_password: 'testpass'
+
+      - name: "OIDC plus token [expected failure]"
+        id: oidc-and-token
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: auth-project
+          publish_version: '1.0.0'
+          registry_url: 'https://registry.npmjs.org/'
+          oidc: 'true'
+          auth_token: 'npm_testTOKEN0123456789abcdefGHIJKLM'
+
+      # npm generates provenance for trusted publishes, so the flag is
+      # redundant and the combination signals a misunderstanding
+      - name: "OIDC plus provenance [expected failure]"
+        id: oidc-and-provenance
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: auth-project
+          publish_version: '1.0.0'
+          registry_url: 'https://registry.npmjs.org/'
+          oidc: 'true'
+          provenance: 'true'
+
+      # This job grants no id-token, so the OIDC preflight must catch
+      # the missing token endpoint before any registry interaction
+      - name: "OIDC without id-token grant [expected failure]"
+        id: oidc-no-token
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: auth-project
+          publish_version: '1.0.0'
+          registry_url: 'https://registry.npmjs.org/'
+          oidc: 'true'
+
+      - name: "Invalid oidc value [expected failure]"
+        id: bad-oidc
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: auth-project
+          publish_version: '1.0.0'
+          registry_url: 'https://registry.npmjs.org/'
+          oidc: 'yes'
+          nexus_password: 'testpass'
+
+      # The preflight below is only reachable with a valid OIDC
+      # configuration, so these run in dry-run mode: no credentials,
+      # no registry interaction, but the toolchain gate still applies.
+      #
+      # Node versions pin the bundled npm, making the outcomes
+      # deterministic: Node 22.14.0 ships npm 10.9.2 (below the 11.5.1
+      # floor) and Node 24 ships npm 11.17.0 (above it).
+      - name: "OIDC toolchain below npm floor [expected failure]"
+        id: toolchain-low
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: auth-project
+          publish_version: '1.0.0'
+          node_version: '22.14.0'
+          oidc: 'true'
+          dry_run: 'true'
+
+      - name: "OIDC toolchain below Node floor [expected failure]"
+        id: toolchain-old-node
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: auth-project
+          publish_version: '1.0.0'
+          node_version: '20'
+          oidc: 'true'
+          dry_run: 'true'
+
+      - name: "OIDC toolchain meets both floors"
+        id: toolchain-ok
+        uses: ./
+        with:
+          path_prefix: auth-project
+          publish_version: '1.0.0'
+          node_version: '24'
+          oidc: 'true'
+          dry_run: 'true'
+
+      - name: "Verify toolchain gate accepted and rejected correctly"
+        shell: bash
+        env:
+          LOW_NPM: ${{ steps.toolchain-low.outcome }}
+          OLD_NODE: ${{ steps.toolchain-old-node.outcome }}
+          SUPPORTED: ${{ steps.toolchain-ok.outcome }}
+          SUPPORTED_VERSION: ${{ steps.toolchain-ok.outputs.published_version }}
+        run: |
+          # Verify toolchain gate accepted and rejected correctly
+          errors=0
+          if [ "${LOW_NPM}" != "failure" ]; then
+            echo "npm below 11.5.1 was accepted ❌"
+            errors=1
+          fi
+          if [ "${OLD_NODE}" != "failure" ]; then
+            echo "Node below 22.14.0 was accepted ❌"
+            errors=1
+          fi
+          # A supported toolchain must clear the gate and still run
+          if [ "${SUPPORTED}" != "success" ]; then
+            echo "Supported toolchain was rejected ❌"
+            errors=1
+          fi
+          if [ "${SUPPORTED_VERSION}" != "1.0.0" ]; then
+            echo "Supported toolchain did not complete the dry run ❌"
+            echo "published_version: ${SUPPORTED_VERSION}"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Toolchain gate tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Toolchain gate behaved correctly ✅"
+          echo "Toolchain gate behaved correctly ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Verify every invalid combination was rejected"
+        shell: bash
+        env:
+          TOKEN_AND_PASSWORD: ${{ steps.token-and-password.outcome }}
+          OIDC_AND_TOKEN: ${{ steps.oidc-and-token.outcome }}
+          OIDC_AND_PROVENANCE: ${{ steps.oidc-and-provenance.outcome }}
+          OIDC_NO_TOKEN: ${{ steps.oidc-no-token.outcome }}
+          BAD_OIDC: ${{ steps.bad-oidc.outcome }}
+        run: |
+          # Verify every invalid combination was rejected
+          errors=0
+          for pair in \
+            "token+password:${TOKEN_AND_PASSWORD}" \
+            "oidc+token:${OIDC_AND_TOKEN}" \
+            "oidc+provenance:${OIDC_AND_PROVENANCE}" \
+            "oidc-without-id-token:${OIDC_NO_TOKEN}" \
+            "invalid-oidc-value:${BAD_OIDC}"; do
+            name="${pair%%:*}"
+            outcome="${pair##*:}"
+            if [ "${outcome}" != "failure" ]; then
+              echo "Combination '${name}' was accepted ❌"
+              errors=1
+            fi
+          done
+          if [ "${errors}" != "0" ]; then
+            echo "Authentication mode tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Invalid authentication modes correctly rejected ✅"
+          echo "Invalid authentication modes correctly rejected ✅" \
+            >> "$GITHUB_STEP_SUMMARY"

@@ -59,9 +59,12 @@ inputs:
     required: false
     default: "false"
   # Credential pass-through for node-create-npmrc-action (unused in
-  # dry-run mode)
+  # dry-run mode). Three mutually exclusive authentication modes:
+  # Basic auth (nexus_user/nexus_password or load_credential), bearer
+  # token (auth_token), or OIDC trusted publishing (oidc).
   nexus_user:
-    description: "Registry username (default: calling repository name)"
+    # yamllint disable-line rule:line-length
+    description: "Basic auth username (default: calling repository name); ignored when auth_token or oidc selects a different mode"
     required: false
     default: ""
   nexus_password:
@@ -69,6 +72,16 @@ inputs:
     description: "Registry password/token; required for non-dry-run publishes unless load_credential is 'true'"
     required: false
     default: ""
+  auth_token:
+    # yamllint disable-line rule:line-length
+    description: "Bearer token written as '_authToken'; use for registries that reject Basic auth (for example registry.npmjs.org). Excludes nexus_password, load_credential and oidc; nexus_user is ignored"
+    required: false
+    default: ""
+  oidc:
+    # yamllint disable-line rule:line-length
+    description: "Publish via npm OIDC trusted publishing ('true'/'false'). Stores no credential: npm exchanges a GitHub OIDC token at publish time and generates provenance itself. Needs 'id-token: write', npm >= 11.5.1 and Node >= 22.14.0"
+    required: false
+    default: "false"
   load_credential:
     # yamllint disable-line rule:line-length
     description: "Fetch the password from 1Password via credential-load-action ('true'/'false')"
@@ -117,7 +130,10 @@ runs:
         INPUT_ACCESS: ${{ inputs.access }}
         INPUT_PROVENANCE: ${{ inputs.provenance }}
         INPUT_LOAD_CREDENTIAL: ${{ inputs.load_credential }}
+        INPUT_NEXUS_USER: ${{ inputs.nexus_user }}
         INPUT_NEXUS_PASSWORD: ${{ inputs.nexus_password }}
+        INPUT_AUTH_TOKEN: ${{ inputs.auth_token }}
+        INPUT_OIDC: ${{ inputs.oidc }}
         INPUT_VAULT_MAPPING_JSON: ${{ inputs.vault_mapping_json }}
         INPUT_OP_SERVICE_ACCOUNT_TOKEN: ${{ inputs.op_service_account_token }}
       run: |
@@ -169,6 +185,12 @@ runs:
           true|false) ;;
           *)
             echo "Error: load_credential must be 'true' or 'false' ❌"
+            exit 1 ;;
+        esac
+        case "${INPUT_OIDC}" in
+          true|false) ;;
+          *)
+            echo "Error: oidc must be 'true' or 'false' ❌"
             exit 1 ;;
         esac
         case "${INPUT_ACCESS}" in
@@ -251,16 +273,70 @@ runs:
               exit 1 ;;
           esac
         fi
+        # Exactly one authentication mode. Basic auth folds a password
+        # into an .npmrc entry, token auth writes a bearer token, and
+        # OIDC stores nothing at all, so accepting more than one would
+        # leave the effective credential ambiguous.
+        modes=0
+        if [ "${INPUT_OIDC}" = "true" ]; then
+          modes=$((modes + 1))
+        fi
+        if [ -n "${INPUT_AUTH_TOKEN}" ]; then
+          modes=$((modes + 1))
+        fi
+        if [ "${INPUT_LOAD_CREDENTIAL}" = "true" ] || \
+          [ -n "${INPUT_NEXUS_PASSWORD}" ]; then
+          modes=$((modes + 1))
+        fi
+        if [ "${modes}" -gt 1 ]; then
+          echo "Error: conflicting authentication modes ❌"
+          echo "Choose one of: oidc, auth_token, or Basic auth"
+          echo "(nexus_password or load_credential)"
+          exit 1
+        fi
         # Real publishes need a credential source; failing here gives
         # a clearer error than a mid-publish authentication failure
-        if [ "${INPUT_DRY_RUN}" != "true" ] && \
-          [ "${INPUT_LOAD_CREDENTIAL}" != "true" ] && \
-          [ -z "${INPUT_NEXUS_PASSWORD}" ]; then
+        if [ "${INPUT_DRY_RUN}" != "true" ] && [ "${modes}" -eq 0 ]; then
           echo "Error: no registry credential configured ❌"
-          echo "Provide nexus_password, or set load_credential to"
-          echo "'true' (with vault_mapping_json and"
-          echo "op_service_account_token)"
+          echo "Provide nexus_password, set load_credential to 'true'"
+          echo "(with vault_mapping_json and"
+          echo "op_service_account_token), provide auth_token, or set"
+          echo "oidc to 'true' for trusted publishing"
           exit 1
+        fi
+        # npm generates provenance itself under trusted publishing, so
+        # --provenance is redundant there and the combination signals a
+        # misunderstanding rather than a harmless overlap
+        if [ "${INPUT_OIDC}" = "true" ] && \
+          [ "${INPUT_PROVENANCE}" = "true" ]; then
+          echo "Error: provenance conflicts with oidc ❌"
+          echo "Trusted publishing generates provenance without the"
+          echo "--provenance flag; leave provenance at 'false'"
+          exit 1
+        fi
+        # OIDC needs a token endpoint, which only appears when the
+        # calling job grants 'id-token: write'. With workflow_call the
+        # grant is needed on both the caller and the called workflow.
+        if [ "${INPUT_OIDC}" = "true" ] && \
+          [ "${INPUT_DRY_RUN}" != "true" ] && \
+          [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "Error: OIDC requested but no token endpoint ❌"
+          echo "Grant 'id-token: write' to the job calling this"
+          echo "action. Using a reusable workflow? Grant it on both"
+          echo "the caller and the called workflow."
+          exit 1
+        fi
+        # nexus_user is a Basic auth username and carries no secret,
+        # so it does not select a mode and does not conflict with one.
+        # Callers computing it unconditionally (matrix publishes that
+        # mix Nexus and npmjs targets) would break if this rejected,
+        # so say it is ignored rather than fail.
+        if [ -n "${INPUT_NEXUS_USER}" ] && \
+          { [ "${INPUT_OIDC}" = "true" ] || \
+            [ -n "${INPUT_AUTH_TOKEN}" ]; }; then
+          echo "::notice::Ignoring nexus_user: it applies to Basic" \
+            "auth, and this publish uses token or OIDC" \
+            "authentication, which carries no username."
         fi
         # load_credential needs both companion inputs; check
         # empty/non-empty alone and never echo the values (secrets)
@@ -396,18 +472,77 @@ runs:
         node-version: ${{ steps.validate.outputs.node_version }}
         node-version-file: ${{ steps.validate.outputs.node_version_file }}
 
+    # Trusted publishing needs npm >= 11.5.1 and Node >= 22.14.0.
+    # Meeting the Node floor does not meet the npm one: Node 22 ships
+    # npm 10.x, so the check runs after setup-node and reports the
+    # remedy rather than upgrading npm behind the caller's back.
+    #
+    # Runs in dry-run mode too. The check needs no credentials and no
+    # network, and a dry run that passed on a toolchain the real
+    # publish would reject defeats the point of rehearsing.
+    - name: "Verify toolchain supports trusted publishing"
+      if: inputs.oidc == 'true'
+      shell: bash
+      run: |
+        # Verify toolchain supports trusted publishing
+        #
+        # sort -V is not semver aware: it places 11.5.1 before
+        # 11.5.1-beta.0, so a prerelease would clear a floor its own
+        # release only just meets. Compare the release portion, then
+        # treat a prerelease of exactly that release as below it.
+        below_floor() {
+          have="$1"
+          need="$2"
+          have_base="${have%%-*}"
+          lowest="$(printf '%s\n%s\n' "${need}" "${have_base}" \
+            | sort -V | head -n1)"
+          if [ "${lowest}" != "${need}" ]; then
+            return 0
+          fi
+          if [ "${have_base}" = "${need}" ] && \
+            [ "${have}" != "${have_base}" ]; then
+            return 0
+          fi
+          return 1
+        }
+        npm_have="$(npm --version)"
+        node_have="$(node --version)"
+        node_have="${node_have#v}"
+        npm_need='11.5.1'
+        node_need='22.14.0'
+        fail=0
+        if below_floor "${npm_have}" "${npm_need}"; then
+          echo "::error::npm ${npm_have} is below the ${npm_need}" \
+            "required for OIDC trusted publishing. Add a step such" \
+            "as 'npm install -g npm@^11' before this action."
+          fail=1
+        fi
+        if below_floor "${node_have}" "${node_need}"; then
+          echo "::error::Node ${node_have} is below the ${node_need}" \
+            "required for OIDC trusted publishing. Raise" \
+            "node_version for this action."
+          fail=1
+        fi
+        if [ "${fail}" != "0" ]; then
+          exit 1
+        fi
+        echo "Toolchain supports trusted publishing ✅"
+        echo "npm ${npm_have}, Node ${node_have}"
+
     # Dry-run mode performs no registry interaction, so it skips the
-    # credential machinery entirely. For real publishes the npmrc
-    # action writes the authenticated .npmrc and registers a
-    # guaranteed post-job step that scrubs it again
+    # credential machinery entirely. OIDC skips it too: npm exchanges
+    # the token at publish time and there is nothing to write. For
+    # everything else the npmrc action writes the authenticated file
+    # and registers a guaranteed post-job step that scrubs it again
     - name: "Create authenticated .npmrc"
-      if: inputs.dry_run != 'true'
+      if: inputs.dry_run != 'true' && inputs.oidc != 'true'
       # yamllint disable-line rule:line-length
-      uses: lfreleng-actions/node-create-npmrc-action@ec0cc1fa52dea5205897d0e3b25dfaf4ebe095fe # v0.1.2
+      uses: lfreleng-actions/node-create-npmrc-action@e0ff8adfc0591c86d8d07828bffab10f43096155 # v0.2.0
       with:
         registry_url: ${{ inputs.registry_url }}
         nexus_user: ${{ inputs.nexus_user }}
         nexus_password: ${{ inputs.nexus_password }}
+        auth_token: ${{ inputs.auth_token }}
         load_credential: ${{ inputs.load_credential }}
         vault_mapping_json: ${{ inputs.vault_mapping_json }}
         op_service_account_token: ${{ inputs.op_service_account_token }}
@@ -548,6 +683,8 @@ runs:
         if [ -n "${ACCESS}" ]; then
           set -- "$@" --access "${ACCESS}"
         fi
+        # No --provenance under OIDC: npm generates provenance itself
+        # for trusted publishes, and validate rejects the combination
         if [ "${PROVENANCE}" = "true" ]; then
           set -- "$@" --provenance
         fi
