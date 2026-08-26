@@ -51,37 +51,44 @@ steps:
 ## Requirements
 
 The action needs `jq`, `realpath` (GNU coreutils, including `-m`
-support) and `mktemp` on the runner. GitHub-hosted Ubuntu runners
+support), `mktemp` and `tr` on the runner. OIDC trusted publishing
+also needs `head` and GNU `sort` with `-V`, for the toolchain floor
+comparison. The action checks that second set when `oidc` is
+`'true'`, leaving Basic and token publishes untouched. GitHub-hosted
+Ubuntu runners
 include these tools; minimal self-hosted or non-Linux runners must
 provide them. The action checks for them up front and fails with a
 clear error naming any missing tool. It installs Node.js and npm via
 the pinned `actions/setup-node` action, without dependency caching.
 Real publishes need egress to the target registry; dry-run mode
-performs no registry interaction.
+publishes nothing, writes no credential, and withholds the OIDC
+token endpoint from npm. That last point holds for every dry run,
+including one requesting `provenance`: npm attaches no provenance to
+a run that publishes nothing, so there is no identity to supply.
 
 ## Inputs
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                     | Required | Default  | Description                                                                          |
-| ------------------------ | -------- | -------- | ------------------------------------------------------------------------------------ |
-| publish_version          | True     |          | Version to stamp and publish, such as `1.2.3` or `1.2.3-SNAPSHOT`                    |
-| registry_url             | False    | `''`     | Target npm registry URL ending with `/`; required unless `dry_run` is `'true'`       |
-| dry_run                  | False    | `false`  | Pack and verify without registry interaction; skips credential setup                 |
-| path_prefix              | False    | `.`      | Project directory; must resolve within the workspace                                 |
-| node_version             | False    | `22`     | Node.js version to set up, such as `22`, `22.x` or `lts/*`                           |
-| node_version_file        | False    | `''`     | File containing the Node.js version, such as `.nvmrc`; overrides `node_version`      |
-| tag                      | False    | `latest` | npm distribution tag                                                                 |
-| access                   | False    | `''`     | Package access: `public`, `restricted` or unset                                      |
-| provenance               | False    | `false`  | Generate registry-native provenance; needs registry and OIDC support                 |
-| nexus_user               | False    | `''`     | Basic auth username (default: calling repository name); ignored by token/OIDC modes  |
-| nexus_password           | False    | `''`     | Registry password for Basic auth; required for real publishes unless another mode    |
-| auth_token               | False    | `''`     | Bearer token written as `_authToken`; for registries rejecting Basic auth            |
-| oidc                     | False    | `false`  | Publish via npm OIDC trusted publishing; stores no credential                        |
-| load_credential          | False    | `false`  | Fetch the password from 1Password via credential-load-action                         |
-| vault_mapping_json       | False    | `''`     | JSON mapping repository owner to 1Password vault (with `load_credential`)            |
-| op_service_account_token | False    | `''`     | 1Password service account token (with `load_credential`)                             |
-| scope                    | False    | `''`     | npm scope for the auth entry (for example `@onap`)                                   |
+| Name                     | Required | Default  | Description                                                                                  |
+| ------------------------ | -------- | -------- | -------------------------------------------------------------------------------------------- |
+| publish_version          | True     |          | Version to stamp and publish, such as `1.2.3` or `1.2.3-SNAPSHOT`                            |
+| registry_url             | False    | `''`     | Target npm registry URL ending with `/`; required unless `dry_run` is `'true'`               |
+| dry_run                  | False    | `false`  | Pack and verify without publishing (npm may still read the registry); skips credential setup |
+| path_prefix              | False    | `.`      | Project directory; must resolve within the workspace                                         |
+| node_version             | False    | `22`     | Node.js version to set up, such as `22`, `22.x` or `lts/*`                                   |
+| node_version_file        | False    | `''`     | File containing the Node.js version, such as `.nvmrc`; overrides `node_version`              |
+| tag                      | False    | `latest` | npm distribution tag                                                                         |
+| access                   | False    | `''`     | Package access: `public`, `restricted` or unset                                              |
+| provenance               | False    | `false`  | Generate registry-native provenance; needs registry and OIDC support                         |
+| nexus_user               | False    | `''`     | Basic auth username (default: calling repository name); ignored by token/OIDC modes          |
+| nexus_password           | False    | `''`     | Registry password for Basic auth; required for real publishes unless another mode            |
+| auth_token               | False    | `''`     | Bearer token written as `_authToken`; for registries rejecting Basic auth                    |
+| oidc                     | False    | `false`  | Publish via npm OIDC trusted publishing; stores no credential                                |
+| load_credential          | False    | `false`  | Fetch the password from 1Password via credential-load-action                                 |
+| vault_mapping_json       | False    | `''`     | JSON mapping repository owner to 1Password vault (with `load_credential`)                    |
+| op_service_account_token | False    | `''`     | 1Password service account token (with `load_credential`)                                     |
+| scope                    | False    | `''`     | npm scope for the auth entry (for example `@onap`)                                           |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -124,8 +131,11 @@ The `nexus_user`, `scope` and credential inputs pass through to
    failing fast with a clear error otherwise. With
    `load_credential: 'true'`, real publishes need non-empty
    `vault_mapping_json` and `op_service_account_token` values too
-2. **Authenticate** (real publishes): `node-create-npmrc-action`
-   writes an authenticated `.npmrc` into the project directory
+2. **Authenticate** (real publishes using Basic or token auth):
+   `node-create-npmrc-action` writes an authenticated `.npmrc` into
+   the project directory. OIDC publishes skip this step entirely:
+   npm exchanges a GitHub OIDC token at publish time, so no
+   credential is ever written to disk and none needs scrubbing
 3. **Stamp**: `npm version <X> --no-git-tag-version
    --allow-same-version --ignore-scripts` updates `package.json`,
    with the result read back and verified. A `::notice::` names any
@@ -143,17 +153,32 @@ The `nexus_user`, `scope` and credential inputs pass through to
 ## Dry-Run Mode
 
 With `dry_run: 'true'` the action runs `npm publish --dry-run`, which
-packs the package and reports the metadata without any registry
-interaction. Dry-run mode skips the `.npmrc`/credential steps
-entirely, so it needs no `registry_url` and no credential inputs.
-Every test in this repository's testing workflow runs in dry-run
-mode; CI holds no registry credentials.
+packs the package and reports the metadata without publishing. npm
+may still consult the registry while doing so. Dry-run mode skips the
+`.npmrc`/credential steps entirely, so it needs no `registry_url` and
+no credential inputs.
+
+CI holds no registry credentials and completes no publish, so the
+testing workflow uses dry-run mode wherever the path under test
+allows it. Two cases cannot, because dry-run mode skips the step
+they exercise: the missing-`id-token` test, which input
+validation rejects before any registry interaction, and the token
+pass-through test, which inspects the generated `.npmrc` and then
+fails against a registry host that does not exist.
 
 ## Authentication Modes
 
 Three mutually exclusive modes. Supplying more than one fails the
 action rather than picking a winner, since the effective credential
 would otherwise be ambiguous.
+
+That exclusivity governs the *inputs*. One case can still leave npm
+free to choose: a Basic or token publish requesting `provenance`
+keeps the OIDC token endpoint available, because npm signs with the
+workflow identity, and npm may then authenticate through a trusted
+publisher if the registry has one registered for the workflow. See
+[Provenance](#provenance). Every other combination clears the
+endpoint, so npm cannot substitute a credential.
 
 ### Basic auth (Nexus)
 
@@ -179,7 +204,32 @@ ignored.
 
 Set `oidc: 'true'`. The action stores no credential anywhere: npm
 exchanges a GitHub OIDC token for a short-lived publish token, and
-generates provenance itself.
+attaches provenance itself where it supports doing so.
+
+Provenance is not universal under OIDC. npm generates it for a
+**public package published from a public repository**, and not
+otherwise, so a private repository, or a package published with
+`access: restricted`, still authenticates and publishes but arrives
+without an attestation. Trusted publishing still buys you the
+absence of a stored credential in that case, which is the larger
+prize for most callers.
+
+One further condition is easy to trip over: npm attaches provenance
+automatically while the `provenance` setting keeps its **default**,
+and not once anything sets it. An explicit `provenance=false` in
+`.npmrc` or in `npm_config_provenance` makes it non-default, and the
+attestation then never appears. The action detects that and emits a
+`::notice::`, treating it as a legitimate opt-out rather than an
+error.
+
+`publishConfig.provenance` behaves differently, and the difference
+catches people out: npm flattens `publishConfig` into the publish
+options rather than into its configuration, so it leaves the setting
+default and trusted publishing still attaches provenance to a public
+package. The action notices that case too, and points at `.npmrc` as
+the way to opt out. An explicit `true` from either source fails the
+run instead, because npm refuses explicit provenance for a
+restricted package.
 
 The action preflights two of the requirements, failing before any
 registry interaction:
@@ -187,11 +237,35 @@ registry interaction:
 - `id-token: write` on the calling job, detected via the token
   endpoint. With `workflow_call`, npm needs the grant on **both** the
   caller and the called workflow
-- npm >= 11.5.1 **and** Node >= 22.14.0. Meeting the Node floor does
+- npm >= 11.5.2 **and** Node >= 22.14.0. Meeting the Node floor does
   not meet the npm one — Node 22 ships npm 10.x, and even Node 24.0.0
-  ships npm 11.3.0 — so run a step such as `npm install -g npm@^11`
-  beforehand. The action reports this rather than upgrading npm
-  behind your back
+  ships npm 11.3.0. The simplest remedy is to raise the Node version
+  this action selects until its bundled npm clears the floor; current
+  Node 24 releases do. Raise it through `node_version`, or through
+  the file named by `node_version_file` when you select Node that
+  way, since that input overrides `node_version` entirely. The action
+  reports this rather than upgrading npm behind your back
+
+  To keep a Node version whose bundled npm is too old, upgrade npm
+  against **that same** version before calling this action:
+
+  ```yaml
+  - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+    with:
+      node-version: '22.14.0'   # the version passed below
+  - run: npm install -g npm@^11
+  - uses: lfreleng-actions/node-publish-action@<sha>
+    with:
+      publish_version: '1.2.3'
+      registry_url: 'https://registry.npmjs.org/'
+      node_version: '22.14.0'
+      oidc: 'true'
+  ```
+
+  Running `npm install -g npm@^11` without first selecting the same
+  Node version has no effect: this action runs `setup-node` itself,
+  which switches to that version's own bundled npm and strands the
+  upgrade on the earlier installation
 
 npm enforces the rest at publish time, and the action cannot check
 them in advance:
@@ -225,10 +299,24 @@ with provenance support (npmjs.org) and requires an OIDC token
 leave the input at `false` for Nexus targets; generate GitHub
 artifact attestations for the packed tarball instead.
 
-With `oidc: 'true'` the flag is redundant, because npm generates
-provenance for trusted publishes on its own. The action rejects the
-combination rather than passing a flag whose effect is already
-implied.
+With `oidc: 'true'` the action rejects the flag rather than passing
+it through: trusted publishing does not take `--provenance`, and npm
+attaches provenance by itself where it supports it. Note the
+qualification above — a restricted package, or one from a private
+repository, gets no provenance either way, so the rejection reflects
+an unsupported flag rather than a promise that an attestation
+follows.
+
+> [!NOTE]
+> `provenance: 'true'` alongside Basic or token auth keeps the OIDC
+> token endpoint available, because npm signs with the workflow
+> identity. On a registry that also has a trusted publisher
+> registered for this workflow, npm may then authenticate through
+> that exchange rather than the credential you supplied. The publish
+> still succeeds and still carries provenance, but the credential
+> used is npm's choice, not this action's. Prefer `oidc: 'true'` for
+> npmjs.org, which makes that the explicit intent and needs no
+> stored credential at all.
 
 ## Path Constraints
 

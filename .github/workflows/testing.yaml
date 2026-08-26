@@ -27,9 +27,13 @@ permissions: {}
 
 jobs:
   ### Test dry-run publishing against both fixtures ###
-  # CI has no registry credentials, so every test runs in dry-run
-  # mode; real publishes exercise the same stamp/publish/verify path
-  # with the credential steps enabled
+  # CI has no registry credentials and completes no publish, so
+  # tests use dry-run mode wherever the path under test allows it;
+  # real publishes exercise the same stamp/publish/verify path with
+  # the credential steps enabled. Two cases in test-auth-modes
+  # cannot be dry runs, because dry-run mode skips the very step
+  # they exercise: the missing-id-token preflight, and the token
+  # pass-through that inspects the generated .npmrc.
   test-dry-run:
     name: "Test: ${{ matrix.name }}"
     runs-on: ubuntu-latest
@@ -435,12 +439,41 @@ jobs:
         run: |
           # Create minimal project fixture
           mkdir -p auth-project
+          # The package name reaches npm during the dry runs below,
+          # which query the registry for an existing version. An
+          # obvious name like 'auth-project' could be registered by
+          # anyone and would then fail CI without a code change, so
+          # use one nobody is plausibly going to claim.
           printf '%s\n' \
-            '{"name": "auth-project", "version": "1.0.0"}' \
+            '{"name": "lfreleng-node-publish-action-test-fixture",' \
+            ' "version": "1.0.0"}' \
             > auth-project/package.json
+          jq -e . auth-project/package.json > /dev/null
+          # Separate fixture for the missing-id-token case, so its
+          # package.json can be asserted untouched without the other
+          # cases having stamped it first
+          mkdir -p no-token-project
+          printf '%s\n' \
+            '{"name": "no-token-project", "version": "1.0.0"}' \
+            > no-token-project/package.json
+          # Fixture for the token pass-through case, kept separate so
+          # the .npmrc written into it belongs to that case alone
+          mkdir -p token-project
+          printf '%s\n' \
+            '{"name": "token-project", "version": "1.0.0"}' \
+            > token-project/package.json
 
       # Ambiguous credentials must fail rather than silently pick one.
       # The token below is a test literal, not a real credential.
+      #
+      # These conflict cases run in dry-run mode, and the OIDC ones on
+      # Node 24, so the validation branch under test is the only thing
+      # standing between the invocation and success. Otherwise a
+      # removed conflict check would leave the case still failing for
+      # an unrelated reason -- the missing id-token grant, or the
+      # unsupported default toolchain -- and so still passing, for the
+      # wrong reason. Dry-run mode skips the credential steps, so if
+      # validation stopped rejecting these they would succeed.
       - name: "Token plus password [expected failure]"
         id: token-and-password
         continue-on-error: true
@@ -451,6 +484,7 @@ jobs:
           registry_url: 'https://registry.npmjs.org/'
           auth_token: 'npm_testTOKEN0123456789abcdefGHIJKLM'
           nexus_password: 'testpass'
+          dry_run: 'true'
 
       - name: "OIDC plus token [expected failure]"
         id: oidc-and-token
@@ -460,8 +494,10 @@ jobs:
           path_prefix: auth-project
           publish_version: '1.0.0'
           registry_url: 'https://registry.npmjs.org/'
+          node_version: '24'
           oidc: 'true'
           auth_token: 'npm_testTOKEN0123456789abcdefGHIJKLM'
+          dry_run: 'true'
 
       # npm generates provenance for trusted publishes, so the flag is
       # redundant and the combination signals a misunderstanding
@@ -473,21 +509,55 @@ jobs:
           path_prefix: auth-project
           publish_version: '1.0.0'
           registry_url: 'https://registry.npmjs.org/'
+          node_version: '24'
           oidc: 'true'
           provenance: 'true'
+          dry_run: 'true'
 
-      # This job grants no id-token, so the OIDC preflight must catch
-      # the missing token endpoint before any registry interaction
-      - name: "OIDC without id-token grant [expected failure]"
-        id: oidc-no-token
+      # Completes the three pairs. Token+Basic and OIDC+token above
+      # leave the INPUT_OIDC/INPUT_NEXUS_PASSWORD branch untested
+      # otherwise, so a regression in it would go unnoticed.
+      - name: "OIDC plus password [expected failure]"
+        id: oidc-and-password
         continue-on-error: true
         uses: ./
         with:
           path_prefix: auth-project
           publish_version: '1.0.0'
           registry_url: 'https://registry.npmjs.org/'
+          node_version: '24'
+          oidc: 'true'
+          nexus_password: 'testpass'
+          dry_run: 'true'
+
+      # This job grants no id-token, so the OIDC preflight must catch
+      # the missing token endpoint before any registry interaction.
+      #
+      # node_version is 24 deliberately. On the default 22 the bundled
+      # npm is 10.x, so a regression in this validation would still
+      # fail the run at the toolchain floor and the case would keep
+      # passing for the wrong reason. Node 24 clears that floor,
+      # leaving the missing token endpoint as the only cause.
+      #
+      # Not a dry run, because the check is skipped in dry-run mode.
+      # The assertion below therefore reads package.json rather than
+      # the outcome alone: validation runs before the stamp, so a
+      # regression that let the run reach the publish attempt would
+      # leave the version stamped, which failure alone cannot show.
+      - name: "OIDC without id-token grant [expected failure]"
+        id: oidc-no-token
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: no-token-project
+          publish_version: '7.7.7'
+          registry_url: 'https://registry.npmjs.org/'
+          node_version: '24'
           oidc: 'true'
 
+      # Dry run for the same reason as the conflict cases above: were
+      # the boolean check dropped, 'yes' would read as not-true,
+      # select Basic auth, and the run would succeed.
       - name: "Invalid oidc value [expected failure]"
         id: bad-oidc
         continue-on-error: true
@@ -498,14 +568,19 @@ jobs:
           registry_url: 'https://registry.npmjs.org/'
           oidc: 'yes'
           nexus_password: 'testpass'
+          dry_run: 'true'
 
       # The preflight below is only reachable with a valid OIDC
-      # configuration, so these run in dry-run mode: no credentials,
-      # no registry interaction, but the toolchain gate still applies.
+      # configuration, so these run in dry-run mode: no credentials
+      # and no publish, though npm may still consult the registry.
+      # The toolchain gate applies either way.
       #
       # Node versions pin the bundled npm, making the outcomes
-      # deterministic: Node 22.14.0 ships npm 10.9.2 (below the 11.5.1
-      # floor) and Node 24 ships npm 11.17.0 (above it).
+      # deterministic: Node 22.14.0 ships npm 10.9.2, below the
+      # 11.5.2 floor, while every current Node 24 release bundles an
+      # npm above it. The exact patch moves, so the cases rely on
+      # which side of the floor each Node line sits, not on a
+      # particular npm version.
       - name: "OIDC toolchain below npm floor [expected failure]"
         id: toolchain-low
         continue-on-error: true
@@ -517,6 +592,13 @@ jobs:
           oidc: 'true'
           dry_run: 'true'
 
+      # The Node floor is not exercised independently here: Node 20
+      # bundles npm 10.8.2, so the npm check fails the run too, and
+      # removing the Node comparison would leave this case passing.
+      # Isolating it would need npm >= 11.5.2 on Node < 22.14.0, and
+      # the action offers no hook to upgrade npm between its own
+      # setup-node step and the check. Kept as a regression guard on
+      # the pair rather than claimed as coverage of the Node floor.
       - name: "OIDC toolchain below Node floor [expected failure]"
         id: toolchain-old-node
         continue-on-error: true
@@ -549,7 +631,7 @@ jobs:
           # Verify toolchain gate accepted and rejected correctly
           errors=0
           if [ "${LOW_NPM}" != "failure" ]; then
-            echo "npm below 11.5.1 was accepted ❌"
+            echo "npm below 11.5.2 was accepted ❌"
             errors=1
           fi
           if [ "${OLD_NODE}" != "failure" ]; then
@@ -575,12 +657,118 @@ jobs:
           echo "Toolchain gate behaved correctly ✅" \
             >> "$GITHUB_STEP_SUMMARY"
 
+      # Every other auth_token case is rejected during validation, so
+      # nothing exercises the pass-through to node-create-npmrc-action
+      # on a valid configuration: a typo in that forwarding would
+      # leave CI green while token publishing was broken.
+      #
+      # This case authenticates for real and then fails at the
+      # publish, because the registry host does not exist (.invalid is
+      # reserved by RFC 2606, so it resolves nowhere and the harden
+      # step blocks it regardless). The failure is the point: the
+      # .npmrc is written before the publish is attempted, and the
+      # scrub runs as a post-job step, so the file is still on disk
+      # for the assertion below.
+      - name: "Token auth writes an authenticated .npmrc"
+        id: token-npmrc
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: token-project
+          publish_version: '1.0.0'
+          registry_url: 'https://registry.example.invalid/'
+          auth_token: 'npm_testTOKEN0123456789abcdefGHIJKLM'
+          # nexus_user carries no secret and selects no mode, so it
+          # must not conflict with token auth -- callers computing it
+          # unconditionally across a Nexus/npmjs matrix depend on
+          # that. Supplying it here keeps the exception covered.
+          nexus_user: 'testuser'
+
+      # The same exception under OIDC, where the .npmrc step is
+      # skipped entirely. A dry run on Node 24 so that nothing else
+      # stands between the invocation and success: were nexus_user
+      # rejected as a conflicting mode, this would fail. Asserting a
+      # failure instead would not discriminate, since a mode conflict
+      # and the missing id-token grant both fail during validation.
+      - name: "OIDC plus nexus_user [accepted]"
+        id: oidc-and-user
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: auth-project
+          publish_version: '1.0.0'
+          node_version: '24'
+          oidc: 'true'
+          nexus_user: 'testuser'
+          dry_run: 'true'
+
+      - name: "Verify the token reached the .npmrc"
+        shell: bash
+        run: |
+          # Verify the token reached the .npmrc
+          errors=0
+          if [ ! -f token-project/.npmrc ]; then
+            echo "Token auth wrote no .npmrc ❌"
+            errors=1
+          # Match the key only. The value is a test literal, but
+          # printing a credential file in CI output is a bad habit to
+          # encode in a test.
+          elif ! grep -q '_authToken=' token-project/.npmrc; then
+            echo "No _authToken entry in the generated .npmrc ❌"
+            errors=1
+          fi
+          # A password entry would mean the wrong mode was selected
+          if [ -f token-project/.npmrc ] && \
+            grep -q '_auth=' token-project/.npmrc; then
+            echo "Token auth wrote a Basic auth entry ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Token pass-through test failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Token reached the generated .npmrc ✅"
+          echo "Token reached the generated .npmrc ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Verify nexus_user never conflicts with a mode"
+        shell: bash
+        env:
+          OIDC_AND_USER: ${{ steps.oidc-and-user.outcome }}
+        run: |
+          # Verify nexus_user never conflicts with a mode
+          errors=0
+          # The token case above supplied nexus_user too. It reached
+          # the .npmrc step, so the username was accepted rather than
+          # rejected as a conflicting mode.
+          if [ ! -f token-project/.npmrc ]; then
+            echo "token plus nexus_user was rejected ❌"
+            errors=1
+          fi
+          # Under OIDC the dry run must complete. A regression that
+          # treated nexus_user as a mode would fail it during
+          # validation.
+          if [ "${OIDC_AND_USER}" != "success" ]; then
+            echo "OIDC plus nexus_user was rejected ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "nexus_user exception tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "nexus_user accepted alongside token and OIDC ✅"
+          echo "nexus_user accepted alongside token and OIDC ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
       - name: "Verify every invalid combination was rejected"
         shell: bash
         env:
           TOKEN_AND_PASSWORD: ${{ steps.token-and-password.outcome }}
           OIDC_AND_TOKEN: ${{ steps.oidc-and-token.outcome }}
           OIDC_AND_PROVENANCE: ${{ steps.oidc-and-provenance.outcome }}
+          OIDC_AND_PASSWORD: ${{ steps.oidc-and-password.outcome }}
           OIDC_NO_TOKEN: ${{ steps.oidc-no-token.outcome }}
           BAD_OIDC: ${{ steps.bad-oidc.outcome }}
         run: |
@@ -590,6 +778,7 @@ jobs:
             "token+password:${TOKEN_AND_PASSWORD}" \
             "oidc+token:${OIDC_AND_TOKEN}" \
             "oidc+provenance:${OIDC_AND_PROVENANCE}" \
+            "oidc+password:${OIDC_AND_PASSWORD}" \
             "oidc-without-id-token:${OIDC_NO_TOKEN}" \
             "invalid-oidc-value:${BAD_OIDC}"; do
             name="${pair%%:*}"
@@ -599,6 +788,17 @@ jobs:
               errors=1
             fi
           done
+          # The missing-id-token case must fail during validation,
+          # before the stamp. A stamped version would mean the run
+          # got as far as the publish attempt and failed there,
+          # which is a regression the outcome alone cannot reveal.
+          unstamped="$(jq -r '.version // empty' \
+            no-token-project/package.json)"
+          if [ "${unstamped}" != "1.0.0" ]; then
+            echo "Missing id-token was caught late ❌"
+            echo "package.json version: ${unstamped}, expected 1.0.0"
+            errors=1
+          fi
           if [ "${errors}" != "0" ]; then
             echo "Authentication mode tests failed ❌" \
               >> "$GITHUB_STEP_SUMMARY"
@@ -606,4 +806,1018 @@ jobs:
           fi
           echo "Invalid authentication modes correctly rejected ✅"
           echo "Invalid authentication modes correctly rejected ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test the OIDC stored-credential guard ###
+  # The only job here granted id-token: write, so OIDC validation
+  # passes and the run reaches the credential guard. That makes the
+  # rejection observable without a registry: the guard runs before
+  # the stamp, so a fixture left unstamped proves it fired early
+  # rather than the publish merely failing for want of a network.
+  #
+  # GitHub issues no OIDC token for a pull request from a fork, so
+  # the grant is downgraded there and validation rejects before the
+  # guard is reached. The job detects that and skips rather than
+  # reporting a failure it cannot avoid; it exercises for real on
+  # push to main, where the head is in this repository.
+  test-oidc-credential-guard:
+    name: "Test: OIDC stored-credential guard"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Granted so OIDC input validation passes and the run reaches
+      # the credential guard under test. The shadowed case is
+      # rejected before the publish, and the control case stops at a
+      # failing prepublishOnly, so neither reaches npm's token
+      # exchange.
+      id-token: write  # reaches the guard; neither case exchanges
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A fork pull request gets no OIDC token however the workflow
+      # is written, so distinguish "cannot run here" from "failed".
+      - name: "Detect OIDC token availability"
+        id: oidc-env
+        shell: bash
+        run: |
+          # Detect OIDC token availability
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "OIDC token endpoint present ✅"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No OIDC token endpoint, so the guard is" \
+              "unreachable and this job self-skips. Expected on a" \
+              "pull request from a fork; the job runs for real on" \
+              "push to main."
+          fi
+
+      # The token below is a test literal, not a real credential.
+      - name: "Create fixture carrying a stored credential"
+        if: steps.oidc-env.outputs.available == 'true'
+        shell: bash
+        run: |
+          # Create fixture carrying a stored credential
+          mkdir -p shadow-project
+          printf '%s\n' \
+            '{"name": "shadow-project", "version": "1.0.0"}' \
+            > shadow-project/package.json
+          printf '%s\n' \
+            '//registry.npmjs.org/:_authToken=npm_testSHADOW0123456789' \
+            > shadow-project/.npmrc
+
+      - name: "OIDC with a stored credential [expected failure]"
+        id: shadowed
+        if: steps.oidc-env.outputs.available == 'true'
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: shadow-project
+          publish_version: '8.8.8'
+          registry_url: 'https://registry.npmjs.org/'
+          node_version: '24'
+          oidc: 'true'
+
+      # A failing prepublishOnly stops npm before it requests an OIDC
+      # token or contacts the registry, so the control case proves
+      # the guard was cleared without exchanging anything. The stamp
+      # runs earlier, and with --ignore-scripts, so the assertion
+      # below is unaffected.
+      - name: "Create fixture with no stored credential"
+        if: steps.oidc-env.outputs.available == 'true'
+        shell: bash
+        run: |
+          # Create fixture with no stored credential
+          mkdir -p clean-project
+          cat > clean-project/package.json << 'FIXTURE'
+          {
+            "name": "clean-project",
+            "version": "1.0.0",
+            "scripts": {
+              "prepublishOnly": "exit 1"
+            }
+          }
+          FIXTURE
+          jq -e . clean-project/package.json > /dev/null
+          printf '%s\n' 'registry=https://registry.npmjs.org/' \
+            > clean-project/.npmrc
+
+      - name: "OIDC with registry-only npmrc [clears the guard]"
+        id: unshadowed
+        if: steps.oidc-env.outputs.available == 'true'
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: clean-project
+          publish_version: '8.8.8'
+          registry_url: 'https://registry.npmjs.org/'
+          node_version: '24'
+          oidc: 'true'
+
+      - name: "Verify the guard rejected only the shadowed fixture"
+        if: steps.oidc-env.outputs.available == 'true'
+        shell: bash
+        env:
+          SHADOWED: ${{ steps.shadowed.outcome }}
+        run: |
+          # Verify the guard rejected only the shadowed fixture
+          errors=0
+          if [ "${SHADOWED}" != "failure" ]; then
+            echo "Stored credential was not rejected ❌"
+            errors=1
+          fi
+          # The guard precedes the stamp, so an untouched version
+          # proves it fired before any publish was attempted
+          stamped="$(jq -r '.version // empty' \
+            shadow-project/package.json)"
+          if [ "${stamped}" != "1.0.0" ]; then
+            echo "Guard fired late: package.json was stamped ❌"
+            echo "package.json version: ${stamped}"
+            errors=1
+          fi
+          # The clean fixture must get past the guard. It still
+          # fails later, at its deliberately failing prepublishOnly,
+          # so assert on the stamp -- which only a cleared guard
+          # reaches, and which runs before that script.
+          clean_stamped="$(jq -r '.version // empty' \
+            clean-project/package.json)"
+          if [ "${clean_stamped}" != "8.8.8" ]; then
+            echo "Registry-only npmrc was rejected by the guard ❌"
+            echo "package.json version: ${clean_stamped}"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "OIDC credential guard tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "OIDC credential guard behaved correctly ✅"
+          echo "OIDC credential guard behaved correctly ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test that non-OIDC publishes cannot see the OIDC token ###
+  # npm attempts a trusted-publish exchange whenever the OIDC
+  # variables are present, which they are in any job granting
+  # id-token: write for an unrelated step. The action clears them for
+  # every publish that is not a genuine trusted publish, so that npm
+  # cannot silently swap the selected credential.
+  #
+  # A prepublishOnly hook observes exactly the environment npm runs
+  # with, so it can report whether the variables survived. Removing
+  # or misspelling one of the unsets fails this job.
+  test-mode-isolation:
+    name: "Test: OIDC variables cleared for non-OIDC publishes"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    env:
+      # Stand-ins for the variables Actions injects with
+      # id-token: write. The values are never used: the action must
+      # remove them before npm runs.
+      ACTIONS_ID_TOKEN_REQUEST_URL: 'https://example.invalid/token'
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'test-request-token'
+      NPM_ID_TOKEN: 'test-id-token'
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Create a fixture that reports npm's environment"
+        shell: bash
+        run: |
+          # Create a fixture that reports npm's environment
+          mkdir -p probe-project
+          cat > probe-project/probe.js << 'PROBE'
+          const fs = require('node:fs');
+          const keys = [
+            'ACTIONS_ID_TOKEN_REQUEST_URL',
+            'ACTIONS_ID_TOKEN_REQUEST_TOKEN',
+            'NPM_ID_TOKEN',
+          ];
+          const seen = keys
+            .map((k) => k + '=' + (process.env[k] ? 'PRESENT' : 'absent'))
+            .join('\n');
+          fs.writeFileSync(process.env.GITHUB_WORKSPACE +
+            '/env-probe.txt', seen + '\n');
+          PROBE
+          cat > probe-project/package.json << 'FIXTURE'
+          {
+            "name": "probe-project",
+            "version": "1.0.0",
+            "scripts": {
+              "prepublishOnly": "node probe.js"
+            }
+          }
+          FIXTURE
+          jq -e . probe-project/package.json > /dev/null
+
+      # A dry run still executes prepublishOnly, so the probe reports
+      # what npm saw without any registry interaction.
+      - name: "Run a non-OIDC publish with the variables present"
+        uses: ./
+        with:
+          path_prefix: probe-project
+          publish_version: '1.0.0'
+          node_version: '22'
+          dry_run: 'true'
+
+      - name: "Verify npm never saw the OIDC variables"
+        shell: bash
+        run: |
+          # Verify npm never saw the OIDC variables
+          if [ ! -f env-probe.txt ]; then
+            echo "prepublishOnly did not run, so the isolation was" \
+              "never observed ❌"
+            exit 1
+          fi
+          errors=0
+          while IFS= read -r probe_line; do
+            case "${probe_line}" in
+              *'=PRESENT')
+                echo "npm could see ${probe_line%%=*} ❌"
+                errors=1 ;;
+            esac
+          done < env-probe.txt
+          if [ "${errors}" != "0" ]; then
+            echo "OIDC variables reached a non-OIDC publish ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "OIDC variables cleared for a non-OIDC publish ✅"
+          echo "OIDC variables cleared for a non-OIDC publish ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test the OIDC stored-credential detection ###
+  # test-oidc-credential-guard runs the whole action and therefore
+  # self-skips on fork pull requests, where GitHub issues no OIDC
+  # token. The detection itself needs no OIDC: it is a function of
+  # npm's merged configuration. So this job runs the shipped step
+  # body directly against fixtures, covering every credential route
+  # and every accept/reject boundary on every pull request.
+  #
+  # The body is extracted from action.yaml rather than restated, so a
+  # regression in the guard fails the test.
+  test-credential-detection:
+    name: "Test: OIDC stored-credential detection"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The guard calls npm and node directly, so provide a toolchain
+      # meeting the same floor a trusted publish would use.
+      - name: "Setup Node.js"
+        # yamllint disable-line rule:line-length
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+
+      - name: "Exercise every credential route through the guard"
+        shell: bash
+        run: |
+          # Exercise every credential route through the guard
+          guard="${RUNNER_TEMP}/guard.sh"
+          python3 -c "import yaml,sys; \
+            d=yaml.safe_load(open('action.yaml')); \
+            m=[x for x in d['runs']['steps'] \
+               if x.get('name') == \
+               'Verify no stored credential shadows OIDC']; \
+            sys.exit('guard step not found') if not m \
+            else sys.stdout.write(m[0]['run'])" > "${guard}"
+          # Fail loudly rather than silently testing nothing if the
+          # step is renamed
+          if ! grep -q 'getCredentialsByURI' "${guard}"; then
+            echo "Could not extract the credential guard ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+          root="${RUNNER_TEMP}/credtest"
+          rm -rf "${root}"
+          mkdir -p "${root}/home" "${root}/proj"
+          printf '%s\n' \
+            '{"name": "cred-fixture", "version": "1.0.0"}' \
+            > "${root}/proj/package.json"
+          errors=0
+          # $1 case name, $2 want (reject|allow), $3 project .npmrc,
+          # $4 user .npmrc. Credentials below are test literals.
+          check() {
+            printf '%s\n' "$3" > "${root}/proj/.npmrc"
+            printf '%s\n' "${4:-}" > "${root}/home/.npmrc"
+            set +e
+            env \
+              HOME="${root}/home" \
+              GITHUB_WORKSPACE="${root}" \
+              PROJECT_DIR='proj' \
+              REGISTRY_URL='https://registry.npmjs.org/' \
+              bash "${guard}" > /dev/null 2>&1
+            rc=$?
+            set -e
+            if [ "${rc}" != "0" ]; then
+              got='reject'
+            else
+              got='allow'
+            fi
+            if [ "${got}" != "$2" ]; then
+              echo "$1: guard returned ${got}, expected $2 ❌"
+              errors=1
+            fi
+          }
+          check 'no credentials' allow ''
+          check 'target _authToken' reject \
+            '//registry.npmjs.org/:_authToken=npm_testTOKEN0123456789'
+          check 'target _auth' reject \
+            '//registry.npmjs.org/:_auth=YWJjOmRlZg=='
+          check 'unrelated registry token' allow \
+            '//npm.pkg.github.com/:_authToken=npm_testTOKEN012345678'
+          # npm's getCredentialsByURI reads one exact nerf dart and
+          # walks no ancestor paths, so a host-level token does not
+          # apply to a publish under a path on that host
+          printf '%s\n' \
+            '//registry.npmjs.org/:_authToken=npm_testTOKENancestor' \
+            > "${root}/proj/.npmrc"
+          printf '%s\n' '' > "${root}/home/.npmrc"
+          set +e
+          env \
+            HOME="${root}/home" \
+            GITHUB_WORKSPACE="${root}" \
+            PROJECT_DIR='proj' \
+            REGISTRY_URL='https://registry.npmjs.org/scoped/' \
+            bash "${guard}" > /dev/null 2>&1
+          ancestor_rc=$?
+          set -e
+          if [ "${ancestor_rc}" != "0" ]; then
+            echo "ancestor-path token was treated as a credential ❌"
+            errors=1
+          fi
+          check 'lone username' allow \
+            '//registry.npmjs.org/:username=testuser'
+          check 'lone _password' allow \
+            '//registry.npmjs.org/:_password=dGVzdA=='
+          basic='//registry.npmjs.org/:username=testuser'
+          basic="${basic}"$'\n''//registry.npmjs.org/:_password=dGVzdA=='
+          check 'username plus _password' reject "${basic}"
+          check 'lone certfile' allow \
+            '//registry.npmjs.org/:certfile=/tmp/c.crt'
+          check 'lone keyfile' allow \
+            '//registry.npmjs.org/:keyfile=/tmp/c.key'
+          mtls='//registry.npmjs.org/:certfile=/tmp/c.crt'
+          mtls="${mtls}"$'\n''//registry.npmjs.org/:keyfile=/tmp/c.key'
+          check 'certfile plus keyfile' reject "${mtls}"
+          check 'registry-only configuration' allow \
+            'registry=https://registry.npmjs.org/'
+          check 'auth-type is not a credential' allow \
+            'auth-type=legacy'
+          check 'cafile is not a credential' allow \
+            'cafile=/tmp/ca.pem'
+          check 'token in the user config' reject '' \
+            '//registry.npmjs.org/:_authToken=npm_testTOKEN987654321'
+          # json=true switches npm config list to JSON, which omits
+          # protected auth keys -- a caller could otherwise blind the
+          # guard through configuration alone
+          json_npmrc='//registry.npmjs.org/:_authToken=npm_testJSON'
+          json_npmrc="${json_npmrc}"$'\n''json=true'
+          check 'token with json=true set' reject "${json_npmrc}"
+          # long=true lists defaults as well, which would make the
+          # default provenance=false look explicitly set
+          long_npmrc='//registry.npmjs.org/:_authToken=npm_testLONG'
+          long_npmrc="${long_npmrc}"$'\n''long=true'
+          check 'token with long=true set' reject "${long_npmrc}"
+          # A token in publishConfig cannot be the fallback: npm
+          # flattens publishConfig into the publish options, while
+          # the fallback lookup reads the live config. Rejecting it
+          # would block a valid publish.
+          printf '%s\n' '' > "${root}/proj/.npmrc"
+          printf '%s\n' '' > "${root}/home/.npmrc"
+          python3 -c "import json; \
+            json.dump({'name': 'cred-fixture', 'version': '1.0.0', \
+              'publishConfig': \
+                {'//registry.npmjs.org/:_authToken': 'npm_testPC'}}, \
+              open('${root}/proj/package.json', 'w'))"
+          set +e
+          env \
+            HOME="${root}/home" \
+            GITHUB_WORKSPACE="${root}" \
+            PROJECT_DIR='proj' \
+            REGISTRY_URL='https://registry.npmjs.org/' \
+            bash "${guard}" > /dev/null 2>&1
+          pubcfg_rc=$?
+          set -e
+          if [ "${pubcfg_rc}" != "0" ]; then
+            echo "publishConfig token was treated as a fallback ❌"
+            errors=1
+          fi
+          printf '%s\n' \
+            '{"name": "cred-fixture", "version": "1.0.0"}' \
+            > "${root}/proj/package.json"
+          # npm merges npm_config_* variables into the same
+          # configuration, so the guard must see them too. Set it via
+          # env rather than export: the name is not a valid shell
+          # identifier, which is precisely why enumerating exported
+          # variables was not enough for the guard either.
+          printf '%s\n' '' > "${root}/proj/.npmrc"
+          printf '%s\n' '' > "${root}/home/.npmrc"
+          set +e
+          env \
+            HOME="${root}/home" \
+            GITHUB_WORKSPACE="${root}" \
+            PROJECT_DIR='proj' \
+            REGISTRY_URL='https://registry.npmjs.org/' \
+            'npm_config_//registry.npmjs.org/:_authToken=npm_testENV' \
+            bash "${guard}" > /dev/null 2>&1
+          env_rc=$?
+          set -e
+          if [ "${env_rc}" = "0" ]; then
+            echo "npm_config_ environment token was not rejected ❌"
+            errors=1
+          fi
+          # A package inside an npm workspace: npm's config commands
+          # fail with ENOWORKSPACES unless workspace handling is
+          # disabled, so without --no-workspaces the guard reads an
+          # empty configuration and refuses every publish from such a
+          # package.
+          mkdir -p "${root}/ws/packages/a"
+          printf '%s\n' '{"name": "ws-root", "version": "1.0.0",' \
+            ' "private": true, "workspaces": ["packages/*"]}' \
+            > "${root}/ws/package.json"
+          printf '%s\n' \
+            '{"name": "ws-child", "version": "1.0.0"}' \
+            > "${root}/ws/packages/a/package.json"
+          ws_check() {
+            printf '%s\n' "$3" > "${root}/ws/packages/a/.npmrc"
+            set +e
+            env \
+              HOME="${root}/home" \
+              GITHUB_WORKSPACE="${root}" \
+              PROJECT_DIR='ws/packages/a' \
+              REGISTRY_URL='https://registry.npmjs.org/' \
+              bash "${guard}" > /dev/null 2>&1
+            rc=$?
+            set -e
+            if [ "${rc}" != "0" ]; then
+              got='reject'
+            else
+              got='allow'
+            fi
+            if [ "${got}" != "$2" ]; then
+              echo "$1: guard returned ${got}, expected $2 ❌"
+              errors=1
+            fi
+          }
+          ws_check 'workspace child, no credentials' allow ''
+          ws_check 'workspace child, target token' reject \
+            '//registry.npmjs.org/:_authToken=npm_testWSTOKEN12345'
+          if [ "${errors}" != "0" ]; then
+            echo "Credential detection tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Credential detection correct across all routes ✅"
+          echo "Credential detection correct across all routes ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test that stamping never touches sibling workspace packages ###
+  # 'npm version' is workspace aware and runs before the publish, so
+  # with workspaces enabled in configuration it stamps every
+  # workspace package and leaves the target alone -- rewriting
+  # manifests that were never part of this publish. The stamp step is
+  # extracted from action.yaml and run against a workspace fixture.
+  test-workspace-stamp:
+    name: "Test: stamping ignores sibling workspace packages"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Setup Node.js"
+        # yamllint disable-line rule:line-length
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+
+      - name: "Stamp a workspace root and check the siblings"
+        shell: bash
+        run: |
+          # Stamp a workspace root and check the siblings
+          stamp="${RUNNER_TEMP}/stamp.sh"
+          python3 -c "import yaml,sys; \
+            d=yaml.safe_load(open('action.yaml')); \
+            m=[x for x in d['runs']['steps'] \
+               if x.get('name') == \
+               'Stamp version into package.json']; \
+            sys.exit('stamp step not found') if not m \
+            else sys.stdout.write(m[0]['run'])" > "${stamp}"
+          if ! grep -q 'no-workspaces' "${stamp}"; then
+            echo "Could not extract the stamp step ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+          root="${RUNNER_TEMP}/wsstamp"
+          rm -rf "${root}"
+          mkdir -p "${root}/home" "${root}/proj/packages/a"
+          errors=0
+          # $1 case, $2 project .npmrc
+          check() {
+            printf '%s\n' '{"name": "ws-root", "version": "1.0.0",' \
+              ' "private": true, "workspaces": ["packages/*"]}' \
+              > "${root}/proj/package.json"
+            printf '%s\n' \
+              '{"name": "ws-child", "version": "1.0.0"}' \
+              > "${root}/proj/packages/a/package.json"
+            printf '%s\n' "$2" > "${root}/proj/.npmrc"
+            set +e
+            env \
+              HOME="${root}/home" \
+              GITHUB_WORKSPACE="${root}" \
+              PROJECT_DIR='proj' \
+              PUBLISH_VERSION='7.7.7' \
+              bash "${stamp}" > /dev/null 2>&1
+            rc=$?
+            set -e
+            target="$(jq -r '.version // empty' \
+              "${root}/proj/package.json")"
+            sibling="$(jq -r '.version // empty' \
+              "${root}/proj/packages/a/package.json")"
+            if [ "${rc}" != "0" ]; then
+              echo "$1: stamp failed ❌"
+              errors=1
+            fi
+            if [ "${target}" != "7.7.7" ]; then
+              echo "$1: target not stamped (${target}) ❌"
+              errors=1
+            fi
+            if [ "${sibling}" != "1.0.0" ]; then
+              echo "$1: sibling was rewritten to ${sibling} ❌"
+              errors=1
+            fi
+          }
+          check 'workspace root, no npm config' ''
+          check 'workspace root, workspaces=true' 'workspaces=true'
+          # A workspace *selector* in an .npmrc conflicts with the
+          # flag rather than being overridden by it, and nothing can
+          # detect it beforehand. It must fail at the stamp -- before
+          # anything publishes -- and say what to do about it.
+          printf '%s\n' '{"name": "ws-root", "version": "1.0.0",' \
+            ' "private": true, "workspaces": ["packages/*"]}' \
+            > "${root}/proj/package.json"
+          printf '%s\n' \
+            '{"name": "ws-child", "version": "1.0.0"}' \
+            > "${root}/proj/packages/a/package.json"
+          printf '%s\n' 'workspace=packages/a' \
+            > "${root}/proj/.npmrc"
+          set +e
+          sel_out="$(env \
+            HOME="${root}/home" \
+            GITHUB_WORKSPACE="${root}" \
+            PROJECT_DIR='proj' \
+            PUBLISH_VERSION='7.7.7' \
+            bash "${stamp}" 2>&1)"
+          sel_rc=$?
+          set -e
+          if [ "${sel_rc}" = "0" ]; then
+            echo "workspace selector: stamp unexpectedly succeeded ❌"
+            errors=1
+          fi
+          if ! printf '%s' "${sel_out}" \
+            | grep -q 'workspace is selected in npm'; then
+            echo "workspace selector: no actionable message ❌"
+            errors=1
+          fi
+          sel_sibling="$(jq -r '.version // empty' \
+            "${root}/proj/packages/a/package.json")"
+          if [ "${sel_sibling}" != "1.0.0" ]; then
+            echo "workspace selector: sibling was rewritten ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Workspace stamping tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Stamping confined to the target package ✅"
+          echo "Stamping confined to the target package ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test the ambient-provenance precedence under OIDC ###
+  # validate rejects the provenance *input* alongside oidc, but npm
+  # also takes provenance from npm_config_provenance, an .npmrc
+  # entry, or publishConfig -- and those sources do not rank equally.
+  # An .npmrc value takes the setting out of its default and so
+  # suppresses npm's automatic attestation; publishConfig does not,
+  # because npm flattens it into the publish options rather than its
+  # configuration.
+  #
+  # The preflight step is extracted from action.yaml and run against
+  # fixtures, so a regression in that ordering fails here rather than
+  # silently changing whether a publish carries an attestation.
+  test-provenance-precedence:
+    name: "Test: ambient provenance precedence"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The step also enforces the toolchain floor, so give it a
+      # toolchain that clears it.
+      - name: "Setup Node.js"
+        # yamllint disable-line rule:line-length
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+
+      - name: "Exercise each provenance source and their precedence"
+        shell: bash
+        run: |
+          # Exercise each provenance source and their precedence
+          preflight="${RUNNER_TEMP}/preflight.sh"
+          python3 -c "import yaml,sys; \
+            d=yaml.safe_load(open('action.yaml')); \
+            m=[x for x in d['runs']['steps'] \
+               if x.get('name') == \
+               'Verify toolchain supports trusted publishing']; \
+            sys.exit('preflight step not found') if not m \
+            else sys.stdout.write(m[0]['run'])" > "${preflight}"
+          if ! grep -q 'ambient_provenance' "${preflight}"; then
+            echo "Could not extract the OIDC preflight ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+          root="${RUNNER_TEMP}/provtest"
+          rm -rf "${root}"
+          mkdir -p "${root}/home" "${root}/proj"
+          errors=0
+          # $1 case, $2 want (pass|fail), $3 want marker, $4 .npmrc,
+          # $5 package.json
+          check() {
+            printf '%s\n' "$4" > "${root}/proj/.npmrc"
+            printf '%s\n' "$5" > "${root}/proj/package.json"
+            set +e
+            out="$(env \
+              HOME="${root}/home" \
+              GITHUB_WORKSPACE="${root}" \
+              PROJECT_DIR='proj' \
+              bash "${preflight}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "${rc}" != "0" ]; then
+              got='fail'
+            else
+              got='pass'
+            fi
+            if [ "${got}" != "$2" ]; then
+              echo "$1: preflight ${got}ed, expected $2 ❌"
+              errors=1
+            fi
+            if [ -n "$3" ] && ! printf '%s' "${out}" | grep -q "$3"; then
+              echo "$1: expected output matching '$3' ❌"
+              errors=1
+            fi
+          }
+          plain='{"name": "prov-fixture", "version": "1.0.0"}'
+          pc_true='{"name": "prov-fixture", "version": "1.0.0",'
+          pc_true="${pc_true}"' "publishConfig": {"provenance": true}}'
+          pc_false='{"name": "prov-fixture", "version": "1.0.0",'
+          pc_false="${pc_false}"' "publishConfig": {"provenance": false}}'
+          # Default: npm attaches provenance itself, nothing to say
+          check 'no provenance set anywhere' pass '' '' "${plain}"
+          # Enabled anywhere is a conflict: trusted publishing
+          # attaches provenance itself, and npm refuses the explicit
+          # flag for a restricted package
+          check 'provenance=true in .npmrc' fail 'conflicts with oidc' \
+            'provenance=true' "${plain}"
+          check 'publishConfig.provenance true' fail \
+            'conflicts with oidc' '' "${pc_true}"
+          # Disabled in configuration takes the setting out of its
+          # default, so npm attaches nothing
+          check 'provenance=false in .npmrc' pass \
+            'carries no attestation' 'provenance=false' "${plain}"
+          # Disabled in publishConfig does not, because npm flattens
+          # it into the options rather than the configuration
+          check 'publishConfig.provenance false' pass \
+            'attaches provenance' '' "${pc_false}"
+          # publishConfig supplies the value npm uses, so this does
+          # not conflict -- but the configuration entry still removed
+          # the default, so no attestation appears
+          check 'npmrc true plus publishConfig false' pass \
+            'carries no attestation' 'provenance=true' "${pc_false}"
+          # npm_config_provenance reaches the same configuration
+          printf '%s\n' '' > "${root}/proj/.npmrc"
+          printf '%s\n' "${plain}" > "${root}/proj/package.json"
+          set +e
+          env \
+            HOME="${root}/home" \
+            GITHUB_WORKSPACE="${root}" \
+            PROJECT_DIR='proj' \
+            npm_config_provenance='true' \
+            bash "${preflight}" > /dev/null 2>&1
+          env_rc=$?
+          set -e
+          if [ "${env_rc}" = "0" ]; then
+            echo "npm_config_provenance=true was not rejected ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Provenance precedence tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Provenance precedence correct across sources ✅"
+          echo "Provenance precedence correct across sources ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test the publish metadata shape normalisation ###
+  # npm 10 put name/version/filename at the top level; npm 11 keys
+  # the object by package name. The action normalises both, and the
+  # discriminator has to be the *type* of .name rather than its
+  # presence, because a package legitimately called 'name' produces
+  # {"name": {...}} under npm 11.
+  #
+  # No fixture can cover that: a dry run for a package named 'name'
+  # would query the real registry, where that name is taken. So the
+  # expression is extracted from action.yaml and run over the shapes
+  # directly -- extracted rather than restated, so a regression in
+  # the shipped filter fails the test.
+  test-publish-metadata:
+    name: "Test: publish metadata normalisation"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Exercise the metadata filter over both npm shapes"
+        shell: bash
+        run: |
+          # Exercise the metadata filter over both npm shapes
+          # shellcheck disable=SC2016  # a jq filter, not a shell var
+          raw="$(grep -A1 -m1 '^        meta="\$(jq -c' action.yaml)"
+          filter="${raw#*jq -c \'}"
+          filter="${filter%\' \\}"
+          # Fail loudly rather than silently testing nothing if the
+          # expression is renamed or reindented
+          if ! printf '%s' "${filter}" | grep -q 'to_entries'; then
+            echo "Could not extract the metadata filter ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+          errors=0
+          check() {
+            got="$(printf '%s' "$2" | jq -c "${filter}" 2>/dev/null \
+              | jq -r '[(.name|tostring), (.version|tostring),
+                        (.filename|tostring)] | join(" ")' \
+              2>/dev/null)"
+            if [ "${got}" != "$3" ]; then
+              echo "$1: got '${got}', want '$3' ❌"
+              errors=1
+            fi
+          }
+          check 'npm10 flat' \
+            '{"name":"pkg","version":"1.0.0","filename":"pkg.tgz"}' \
+            'pkg 1.0.0 pkg.tgz'
+          check 'npm11 keyed' \
+            '{"pkg":{"name":"pkg","version":"1.0.0","filename":"pkg.tgz"}}' \
+            'pkg 1.0.0 pkg.tgz'
+          scoped_in='{"@onap/ui":{"name":"@onap/ui",'
+          scoped_in="${scoped_in}"'"version":"2.0.0",'
+          scoped_in="${scoped_in}"'"filename":"onap-ui-2.0.0.tgz"}}'
+          check 'npm11 scoped key' "${scoped_in}" \
+            '@onap/ui 2.0.0 onap-ui-2.0.0.tgz'
+          named_in='{"name":{"name":"name","version":"3.0.0",'
+          named_in="${named_in}"'"filename":"name-3.0.0.tgz"}}'
+          check 'npm11 package literally named name' "${named_in}" \
+            'name 3.0.0 name-3.0.0.tgz'
+          check 'npm10 package literally named name' \
+            '{"name":"name","version":"3.0.0","filename":"name-3.0.0.tgz"}' \
+            'name 3.0.0 name-3.0.0.tgz'
+          check 'empty object fails closed' '{}' 'null null null'
+          if [ "${errors}" != "0" ]; then
+            echo "Metadata normalisation tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Publish metadata normalisation correct ✅"
+          echo "Publish metadata normalisation correct ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test the OIDC toolchain version comparison ###
+  # The toolchain cases in test-auth-modes only ever see npm 10.8,
+  # 10.9 and 11.17, so they cannot reach the boundary this function
+  # exists to handle: a prerelease of the floor release itself.
+  # Swapping it back for a plain 'sort -V' would leave every other
+  # test green while 11.5.2-beta.0 was accepted -- which is exactly
+  # the defect that reached review on this branch.
+  #
+  # The function is extracted from action.yaml rather than restated
+  # here, so this exercises the shipped implementation. Restating it
+  # would test a copy and pass even after the original regressed.
+  test-version-floor:
+    name: "Test: toolchain version comparison"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Exercise below_floor() over the boundary cases"
+        shell: bash
+        run: |
+          # Exercise below_floor() over the boundary cases
+          fn="${RUNNER_TEMP}/below_floor.sh"
+          sed -n '/^        below_floor() {$/,/^        }$/p' \
+            action.yaml > "${fn}"
+          # Fail loudly rather than silently testing nothing if the
+          # function is renamed or reindented
+          if ! grep -q 'below_floor()' "${fn}"; then
+            echo "Could not extract below_floor() from action.yaml ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+          # shellcheck source=/dev/null
+          . "${fn}"
+          errors=0
+          # want=BELOW means the version must be rejected
+          while read -r have need want; do
+            [ -n "${have}" ] || continue
+            if below_floor "${have}" "${need}"; then
+              got=BELOW
+            else
+              got=OK
+            fi
+            if [ "${got}" != "${want}" ]; then
+              echo "below_floor(${have}, ${need}) = ${got}," \
+                "expected ${want} ❌"
+              errors=1
+            fi
+          done <<'CASES'
+          11.5.2-beta.0 11.5.2 BELOW
+          11.5.2-rc.1 11.5.2 BELOW
+          11.5.2 11.5.2 OK
+          11.5.3 11.5.2 OK
+          11.6.0-rc.1 11.5.2 OK
+          11.5.1 11.5.2 BELOW
+          11.3.0 11.5.2 BELOW
+          10.9.2 11.5.2 BELOW
+          10.8.2 11.5.2 BELOW
+          12.0.0 11.5.2 OK
+          22.14.0 22.14.0 OK
+          22.14.0-pre 22.14.0 BELOW
+          22.13.1 22.14.0 BELOW
+          20.19.5 22.14.0 BELOW
+          24.19.0 22.14.0 OK
+          24.0.0-nightly 22.14.0 OK
+          CASES
+          if [ "${errors}" != "0" ]; then
+            echo "Version floor comparison failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Version floor comparison correct ✅"
+          echo "Version floor comparison correct ✅" \
             >> "$GITHUB_STEP_SUMMARY"
